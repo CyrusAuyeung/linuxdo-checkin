@@ -132,16 +132,25 @@ class LinuxDoBrowser:
         if COOKIE_STR:
             logger.info("检测到 LINUXDO_COOKIE 配置，尝试通过 Cookie 免密登录...")
             try:
-                # 1. 设置 DrissionPage Cookies
-                # 解析 cookie 字符串并设置到浏览器
+                # 1. 准备 Cookie 列表 (这是修复的关键点)
+                dp_cookies = []
                 for item in COOKIE_STR.split(';'):
                     if '=' in item:
                         # 只分割第一个等号，防止值里面也有等号
                         key, value = item.strip().split('=', 1)
-                        self.page.set.cookies(name=key, value=value, domain=".linux.do")
+                        # 构建 DrissionPage 需要的字典格式
+                        dp_cookies.append({
+                            "name": key, 
+                            "value": value, 
+                            "domain": ".linux.do", 
+                            "path": "/"
+                        })
 
-                # 2. 设置 requests Session Headers
-                # requests 直接使用 Cookie 头通常比解析成 dict 更稳定
+                # 2. 一次性设置所有 Cookies
+                # 之前报错是因为 set.cookies 不支持 name=... 这种参数，必须传列表
+                self.page.set.cookies(dp_cookies)
+
+                # 3. 设置 requests Session Headers
                 headers = {
                     "Cookie": COOKIE_STR
                 }
