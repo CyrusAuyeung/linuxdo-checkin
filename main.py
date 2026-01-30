@@ -45,8 +45,11 @@ def retry_decorator(retries=3, min_delay=5, max_delay=10):
 os.environ.pop("DISPLAY", None)
 os.environ.pop("DYLD_LIBRARY_PATH", None)
 
+# 读取环境变量
 USERNAME = os.environ.get("LINUXDO_USERNAME")
 PASSWORD = os.environ.get("LINUXDO_PASSWORD")
+COOKIE_STR = os.environ.get("LINUXDO_COOKIE") # 新增 Cookie 变量
+
 BROWSE_ENABLED = os.environ.get("BROWSE_ENABLED", "true").strip().lower() not in [
     "false",
     "0",
@@ -56,6 +59,7 @@ if not USERNAME:
     USERNAME = os.environ.get("USERNAME")
 if not PASSWORD:
     PASSWORD = os.environ.get("PASSWORD")
+    
 GOTIFY_URL = os.environ.get("GOTIFY_URL")  # Gotify 服务器地址
 GOTIFY_TOKEN = os.environ.get("GOTIFY_TOKEN")  # Gotify 应用的 API Token
 SC3_PUSH_KEY = os.environ.get("SC3_PUSH_KEY")  # Server酱³ SendKey
@@ -101,35 +105,96 @@ class LinuxDoBrowser:
             }
         )
 
+    def check_login_success(self):
+        """辅助函数：检查页面是否包含登录后的元素"""
+        try:
+            # 检查 current-user ID
+            user_ele = self.page.ele("@id=current-user")
+            if user_ele:
+                logger.success("✅ 登录验证成功 (找到 current-user)")
+                return True
+            
+            # 备用方案：检查是否含有头像元素
+            if "avatar" in self.page.html:
+                logger.success("✅ 登录验证成功 (找到 avatar)")
+                return True
+                
+        except Exception:
+            pass
+        return False
+
     def login(self):
-        logger.info("开始登录")
+        logger.info("开始登录流程...")
+
+        # ---------------------------------------------------------------------
+        # 方案 A: 优先尝试 Cookie 登录 (推荐)
+        # ---------------------------------------------------------------------
+        if COOKIE_STR:
+            logger.info("检测到 LINUXDO_COOKIE 配置，尝试通过 Cookie 免密登录...")
+            try:
+                # 1. 设置 DrissionPage Cookies
+                # 解析 cookie 字符串并设置到浏览器
+                for item in COOKIE_STR.split(';'):
+                    if '=' in item:
+                        # 只分割第一个等号，防止值里面也有等号
+                        key, value = item.strip().split('=', 1)
+                        self.page.set.cookies(name=key, value=value, domain=".linux.do")
+
+                # 2. 设置 requests Session Headers
+                # requests 直接使用 Cookie 头通常比解析成 dict 更稳定
+                headers = {
+                    "Cookie": COOKIE_STR
+                }
+                self.session.headers.update(headers)
+
+                logger.info("Cookie 设置完毕，正在前往主页验证...")
+                self.page.get(HOME_URL)
+                time.sleep(3)  # 等待页面加载
+
+                # 验证是否登录成功
+                if self.check_login_success():
+                    return True
+                else:
+                    logger.warning("Cookie 登录失效 (可能是 Cookie 过期)，尝试回退到账号密码登录...")
+            except Exception as e:
+                logger.error(f"Cookie 登录过程出错: {e}")
+                logger.info("尝试回退到账号密码登录...")
+
+        # ---------------------------------------------------------------------
+        # 方案 B: 原有的账号密码登录 (易被 Cloudflare 拦截)
+        # ---------------------------------------------------------------------
+        if not USERNAME or not PASSWORD:
+            logger.error("未配置账号密码，且 Cookie 登录失败/未配置。无法继续。")
+            return False
+
+        logger.info("尝试使用账号密码登录...")
+        
         # Step 1: Get CSRF Token
         logger.info("获取 CSRF token...")
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36 Edg/142.0.0.0",
-            "Accept": "application/json, text/javascript, */*; q=0.01",
-            "Accept-Language": "zh-CN,zh;q=0.9",
             "X-Requested-With": "XMLHttpRequest",
             "Referer": LOGIN_URL,
         }
-        resp_csrf = self.session.get(CSRF_URL, headers=headers, impersonate="chrome136")
-        
-        # --- 新增调试代码 Start ---
-        if resp_csrf.status_code != 200:
-            logger.error(f"CSRF请求状态码异常: {resp_csrf.status_code}")
         
         try:
+            resp_csrf = self.session.get(CSRF_URL, headers=headers, impersonate="chrome136")
+            
+            # 检查是否被 WAF 拦截 (返回 HTML 而不是 JSON)
+            if resp_csrf.status_code == 403 or "<html" in resp_csrf.text[:100].lower():
+                logger.error("❌ 获取 CSRF 失败: GitHub IP 可能被 Cloudflare 拦截 (403 Forbidden / Challenge Page)")
+                logger.error("建议配置 'LINUXDO_COOKIE' 环境变量以跳过此步骤。")
+                return False
+                
             csrf_data = resp_csrf.json()
+            csrf_token = csrf_data.get("csrf")
+            logger.info(f"CSRF Token obtained: {csrf_token[:10]}...")
+            
         except Exception as e:
-            logger.error("无法解析 JSON，可能被 WAF/Cloudflare 拦截")
-            logger.error(f"服务器返回内容摘要: {resp_csrf.text[:500]}") # 打印前500个字符看看是不是HTML
+            logger.error(f"解析 CSRF 响应失败: {e}")
             return False
-        # --- 新增调试代码 End ---
-        csrf_token = csrf_data.get("csrf")
-        logger.info(f"CSRF Token obtained: {csrf_token[:10]}...")
 
-        # Step 2: Login
-        logger.info("正在登录...")
+        # Step 2: Login Request
+        logger.info("正在发送登录请求...")
         headers.update(
             {
                 "X-CSRF-Token": csrf_token,
@@ -153,12 +218,12 @@ class LinuxDoBrowser:
             if resp_login.status_code == 200:
                 response_json = resp_login.json()
                 if response_json.get("error"):
-                    logger.error(f"登录失败: {response_json.get('error')}")
+                    logger.error(f"登录接口返回错误: {response_json.get('error')}")
                     return False
-                logger.info("登录成功!")
+                logger.info("登录接口请求成功!")
             else:
                 logger.error(f"登录失败，状态码: {resp_login.status_code}")
-                logger.error(resp_login.text)
+                logger.error(resp_login.text[:200]) # 只打印前200字符防止刷屏
                 return False
         except Exception as e:
             logger.error(f"登录请求异常: {e}")
@@ -167,18 +232,8 @@ class LinuxDoBrowser:
         self.print_connect_info()  # 打印连接信息
 
         # Step 3: Pass cookies to DrissionPage
-        logger.info("同步 Cookie 到 DrissionPage...")
-
-        # Convert requests cookies to DrissionPage format
-        # Using standard requests.utils to parse cookiejar if possible, or manual extraction
-        # requests.Session().cookies is a specialized object, but might support standard iteration
-
-        # We can iterate over the cookies manually if dict_from_cookiejar doesn't work perfectly
-        # or convert to dict first.
-        # Assuming requests behaves like requests:
-
+        logger.info("同步 Session Cookie 到 DrissionPage...")
         cookies_dict = self.session.cookies.get_dict()
-
         dp_cookies = []
         for name, value in cookies_dict.items():
             dp_cookies.append(
@@ -189,28 +244,17 @@ class LinuxDoBrowser:
                     "path": "/",
                 }
             )
-
         self.page.set.cookies(dp_cookies)
 
-        logger.info("Cookie 设置完成，导航至 linux.do...")
+        logger.info("导航至 linux.do...")
         self.page.get(HOME_URL)
-
         time.sleep(5)
-        try:
-            user_ele = self.page.ele("@id=current-user")
-        except Exception as e:
-            logger.warning(f"登录验证失败: {str(e)}")
+        
+        if self.check_login_success():
             return True
-        if not user_ele:
-            # Fallback check for avatar
-            if "avatar" in self.page.html:
-                logger.info("登录验证成功 (通过 avatar)")
-                return True
-            logger.error("登录验证失败 (未找到 current-user)")
-            return False
         else:
-            logger.info("登录验证成功")
-            return True
+            logger.error("登录后页面验证失败")
+            return False
 
     def click_topic(self):
         topic_list = self.page.ele("@id=list-area").eles(".:title")
@@ -270,7 +314,8 @@ class LinuxDoBrowser:
         try:
             login_res = self.login()
             if not login_res:  # 登录
-                logger.warning("登录验证失败")
+                logger.warning("登录验证失败，终止任务")
+                return
 
             if BROWSE_ENABLED:
                 click_topic_res = self.click_topic()  # 点击主题
@@ -309,26 +354,31 @@ class LinuxDoBrowser:
         headers = {
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
         }
-        resp = self.session.get(
-            "https://connect.linux.do/", headers=headers, impersonate="chrome136"
-        )
-        soup = BeautifulSoup(resp.text, "html.parser")
-        rows = soup.select("table tr")
-        info = []
+        try:
+            resp = self.session.get(
+                "https://connect.linux.do/", headers=headers, impersonate="chrome136"
+            )
+            soup = BeautifulSoup(resp.text, "html.parser")
+            rows = soup.select("table tr")
+            info = []
 
-        for row in rows:
-            cells = row.select("td")
-            if len(cells) >= 3:
-                project = cells[0].text.strip()
-                current = cells[1].text.strip() if cells[1].text.strip() else "0"
-                requirement = cells[2].text.strip() if cells[2].text.strip() else "0"
-                info.append([project, current, requirement])
+            for row in rows:
+                cells = row.select("td")
+                if len(cells) >= 3:
+                    project = cells[0].text.strip()
+                    current = cells[1].text.strip() if cells[1].text.strip() else "0"
+                    requirement = cells[2].text.strip() if cells[2].text.strip() else "0"
+                    info.append([project, current, requirement])
 
-        print("--------------Connect Info-----------------")
-        print(tabulate(info, headers=["项目", "当前", "要求"], tablefmt="pretty"))
+            print("--------------Connect Info-----------------")
+            print(tabulate(info, headers=["项目", "当前", "要求"], tablefmt="pretty"))
+        except Exception as e:
+            logger.error(f"获取连接信息失败: {e}")
 
     def send_notifications(self, browse_enabled):
-        status_msg = f"✅每日登录成功: {USERNAME}"
+        # 优先使用 Cookie 里的名字，如果没有则用环境变量，都没有则显示 "User"
+        display_name = USERNAME if USERNAME else "LinuxDo User"
+        status_msg = f"✅每日登录成功: {display_name}"
         if browse_enabled:
             status_msg += " + 浏览任务完成"
 
@@ -393,8 +443,12 @@ class LinuxDoBrowser:
 
 
 if __name__ == "__main__":
-    if not USERNAME or not PASSWORD:
-        print("Please set USERNAME and PASSWORD")
+    # 放宽检查：只要有 COOKIE 或者有 账号+密码 就可以运行
+    if not COOKIE_STR and (not USERNAME or not PASSWORD):
+        print("Error: Missing credentials.")
+        print("Please set 'LINUXDO_COOKIE' (Recommended for GitHub Actions)")
+        print("OR set 'LINUXDO_USERNAME' and 'LINUXDO_PASSWORD' (May be blocked by Cloudflare)")
         exit(1)
+        
     l = LinuxDoBrowser()
     l.run()
