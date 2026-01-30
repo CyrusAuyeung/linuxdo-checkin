@@ -113,7 +113,18 @@ class LinuxDoBrowser:
             "Referer": LOGIN_URL,
         }
         resp_csrf = self.session.get(CSRF_URL, headers=headers, impersonate="chrome136")
-        csrf_data = resp_csrf.json()
+        
+        # --- 新增调试代码 Start ---
+        if resp_csrf.status_code != 200:
+            logger.error(f"CSRF请求状态码异常: {resp_csrf.status_code}")
+        
+        try:
+            csrf_data = resp_csrf.json()
+        except Exception as e:
+            logger.error("无法解析 JSON，可能被 WAF/Cloudflare 拦截")
+            logger.error(f"服务器返回内容摘要: {resp_csrf.text[:500]}") # 打印前500个字符看看是不是HTML
+            return False
+        # --- 新增调试代码 End ---
         csrf_token = csrf_data.get("csrf")
         logger.info(f"CSRF Token obtained: {csrf_token[:10]}...")
 
