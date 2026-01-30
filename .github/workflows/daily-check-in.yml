@@ -38,6 +38,7 @@ jobs:
           SC3_PUSH_KEY: ${{ secrets.SC3_PUSH_KEY }}
           WXPUSH_URL: ${{ secrets.WXPUSH_URL }}
           WXPUSH_TOKEN: ${{ secrets.WXPUSH_TOKEN }}
+          WXPUSH_UID: ${{ secrets.WXPUSH_UID }}
           BROWSE_ENABLED: ${{ secrets.BROWSE_ENABLED }}
         run: |
           python main.py
